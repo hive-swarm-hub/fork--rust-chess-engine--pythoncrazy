@@ -1,6 +1,6 @@
 {
   "phase": "loop",
-  "best_elo": 2625.5,
-  "best_commit": "4fc2eec",
-  "iteration": 4
+  "best_elo": 2800.0,
+  "best_commit": "797f2fe",
+  "iteration": 5
 }
