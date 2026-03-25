@@ -129,6 +129,8 @@ fn main() {
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -140,7 +142,7 @@ use chess::{
 const INFINITY: i32 = 1_000_000;
 const MATE_SCORE: i32 = 100_000;
 const DRAW_SCORE: i32 = 0;
-const ASPIRATION_WINDOW: i32 = 40;
+const ASPIRATION_WINDOW: i32 = 30;
 const HISTORY_SIZE: usize = 1 << 16;
 const KILLER_PLY_CAPACITY: usize = 128;
 const MAX_ROOT_THREADS: usize = 8;
@@ -398,6 +400,123 @@ impl Default for TTEntry {
     }
 }
 
+// Lock-less shared transposition table using XOR trick (Hyatt's technique).
+// Each logical slot uses 2 AtomicU64:
+//   slot[2*i]   = hash XOR data  (check word)
+//   slot[2*i+1] = packed data    (data word)
+//
+// Data word packing:
+//   bits[63:56] = depth (8 bits)
+//   bits[55:54] = flag  (2 bits: 0=EXACT, 1=LOWER, 2=UPPER)
+//   bits[53:32] = score (22 bits, signed, biased by TT_SCORE_BIAS)
+//   bits[31:26] = from_sq (6 bits, 0-63)
+//   bits[25:20] = to_sq   (6 bits, 0-63)
+//   bits[19:16] = promo   (4 bits: 0=none, 1=Q, 2=R, 3=B, 4=N)
+//   bits[15:0]  = unused
+const TT_SCORE_BIAS: i32 = 1 << 21; // 2097152, ensures score+bias is non-negative
+
+fn pack_tt_data(depth: i32, flag: u8, score: i32, best_move: Option<ChessMove>) -> u64 {
+    let depth_bits = ((depth as u64) & 0xFF) << 56;
+    let flag_bits  = ((flag as u64) & 0x3)   << 54;
+    let score_bits = (((score + TT_SCORE_BIAS) as u64) & 0x3F_FFFF) << 32;
+    let (from_bits, to_bits, promo_bits) = if let Some(mv) = best_move {
+        let from = mv.get_source().to_index() as u64;
+        let to   = mv.get_dest().to_index() as u64;
+        let promo = match mv.get_promotion() {
+            None                    => 0u64,
+            Some(Piece::Queen)      => 1,
+            Some(Piece::Rook)       => 2,
+            Some(Piece::Bishop)     => 3,
+            Some(Piece::Knight)     => 4,
+            _                       => 0,
+        };
+        (from << 26, to << 20, promo << 16)
+    } else {
+        (0, 0, 0)
+    };
+    depth_bits | flag_bits | score_bits | from_bits | to_bits | promo_bits
+}
+
+fn unpack_tt_data(data: u64) -> (i32, u8, i32, Option<ChessMove>) {
+    let depth = ((data >> 56) & 0xFF) as i32;
+    let flag  = ((data >> 54) & 0x3)  as u8;
+    let score = (((data >> 32) & 0x3F_FFFF) as i32) - TT_SCORE_BIAS;
+    let from_idx  = ((data >> 26) & 0x3F) as u8;
+    let to_idx    = ((data >> 20) & 0x3F) as u8;
+    let promo_idx = ((data >> 16) & 0xF)  as u8;
+    let best_move = {
+        let from = Square::make_square(
+            Rank::from_index(from_idx as usize >> 3),
+            File::from_index(from_idx as usize & 7),
+        );
+        let to = Square::make_square(
+            Rank::from_index(to_idx as usize >> 3),
+            File::from_index(to_idx as usize & 7),
+        );
+        let promo = match promo_idx {
+            1 => Some(Piece::Queen),
+            2 => Some(Piece::Rook),
+            3 => Some(Piece::Bishop),
+            4 => Some(Piece::Knight),
+            _ => None,
+        };
+        // A move from A1->A1 with no promo could be ambiguous; treat as no-move.
+        // In practice depth=0 entries have no best_move anyway.
+        if from_idx == 0 && to_idx == 0 && promo_idx == 0 {
+            None
+        } else {
+            Some(ChessMove::new(from, to, promo))
+        }
+    };
+    (depth, flag, score, best_move)
+}
+
+/// Shared transposition table — Arc-wrapped so workers share one instance.
+#[derive(Clone)]
+struct SharedTT {
+    table: Arc<Vec<AtomicU64>>,
+    mask:  usize,
+}
+
+impl SharedTT {
+    fn new(size: usize) -> Self {
+        // size must be power-of-2; each logical slot = 2 AtomicU64
+        let mut v = Vec::with_capacity(size * 2);
+        for _ in 0..size * 2 { v.push(AtomicU64::new(0)); }
+        SharedTT { table: Arc::new(v), mask: size - 1 }
+    }
+
+    fn probe(&self, hash: u64) -> Option<TTEntry> {
+        let idx = (hash as usize & self.mask) * 2;
+        let check = self.table[idx    ].load(Ordering::Relaxed);
+        let data  = self.table[idx + 1].load(Ordering::Relaxed);
+        if check ^ data != hash {
+            return None;
+        }
+        let (depth, flag, score, best_move) = unpack_tt_data(data);
+        Some(TTEntry { key: hash, depth, score, flag, best_move })
+    }
+
+    fn store(&self, hash: u64, depth: i32, flag: u8, score: i32, best_move: Option<ChessMove>,
+             existing_depth: i32)
+    {
+        let idx = (hash as usize & self.mask) * 2;
+        // Always-replace by depth: only overwrite if new depth >= existing, or empty.
+        let old_data = self.table[idx + 1].load(Ordering::Relaxed);
+        let old_check = self.table[idx].load(Ordering::Relaxed);
+        let old_hash = old_check ^ old_data;
+        if old_hash != 0 && old_hash != hash {
+            // Different position — only replace if we have a deeper search.
+            let (old_depth, _, _, _) = unpack_tt_data(old_data);
+            if depth < old_depth { return; }
+        }
+        let _ = existing_depth; // already checked above
+        let data = pack_tt_data(depth, flag, score, best_move);
+        self.table[idx + 1].store(data,       Ordering::Relaxed);
+        self.table[idx    ].store(hash ^ data, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct EvalCacheEntry {
     key: u64,
@@ -481,18 +600,12 @@ struct RawSearchResult {
     pv_uci: Vec<String>,
 }
 
-struct RootChunkResult {
-    best_move: Option<ChessMove>,
-    best_score: i32,
-    nodes: u64,
-    tt: Vec<TTEntry>,
-}
 
 struct RustAlphaBetaEngine {
     depth: i32,
     threads: usize,
     nodes: u64,
-    tt: Vec<TTEntry>,
+    tt: SharedTT,
     killer_moves: Vec<[Option<ChessMove>; 2]>,
     history_heuristic: Vec<i32>,
     capture_history: Vec<i16>,
@@ -503,6 +616,7 @@ struct RustAlphaBetaEngine {
     pawn_cache: Vec<PawnCacheEntry>,
     deadline: Option<Instant>,
     stopped: bool,
+    stop_flag: Arc<AtomicBool>, // shared stop signal for Lazy SMP workers
     opening_book: HashMap<u64, &'static str>,
 }
 
@@ -512,7 +626,7 @@ impl RustAlphaBetaEngine {
             depth,
             threads: available_root_threads(),
             nodes: 0,
-            tt: vec![TTEntry::default(); TT_SIZE],
+            tt: SharedTT::new(TT_SIZE),
             killer_moves: vec![[None, None]; KILLER_PLY_CAPACITY],
             history_heuristic: vec![0; HISTORY_SIZE],
             capture_history: vec![0; HISTORY_SIZE * CAPTURE_HISTORY_PIECES],
@@ -523,6 +637,7 @@ impl RustAlphaBetaEngine {
             pawn_cache: vec![PawnCacheEntry::default(); PAWN_CACHE_SIZE],
             deadline: None,
             stopped: false,
+            stop_flag: Arc::new(AtomicBool::new(false)),
             opening_book: build_opening_book(),
         }
     }
@@ -581,8 +696,41 @@ impl RustAlphaBetaEngine {
         };
         self.nodes = 0;
         self.stopped = false;
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        self.stop_flag = Arc::clone(&stop_flag);
         let search_start = Instant::now();
         self.deadline = time_budget.map(|budget| search_start + budget);
+
+        // Lazy SMP: spawn N-1 helper threads that search in parallel, sharing the TT.
+        // Each helper uses the same board & repetition context, but has independent
+        // history/killers so they explore different branches. The shared TT propagates
+        // all knowledge across threads automatically.
+        let n_helpers = self.threads.saturating_sub(1).min(7); // cap at 7 helpers
+        let helper_handles: Vec<_> = if n_helpers > 0 && time_budget.is_some() {
+            let board_copy = board;
+            let rep_copy = repetition.clone();
+            (0..n_helpers).map(|_helper_id| {
+                let mut worker = self.worker_clone();
+                let stop = Arc::clone(&stop_flag);
+                let brd = board_copy;
+                let mut rep = rep_copy.clone();
+                let depth_limit = target_depth;
+                let deadline = self.deadline;
+                thread::spawn(move || {
+                    worker.stop_flag = stop;
+                    worker.deadline = deadline;
+                    // Helper does its own iterative deepening; shared TT helps main thread
+                    for d in 1..=depth_limit {
+                        if worker.stop_flag.load(Ordering::Relaxed) { break; }
+                        worker.stopped = false;
+                        worker.ensure_ply_capacity(d as usize + 16);
+                        if worker.search_root(&brd, d, None, &mut rep).is_none() { break; }
+                    }
+                })
+            }).collect()
+        } else {
+            Vec::new()
+        };
 
         let mut best_move: Option<ChessMove> = None;
         let mut best_score = 0;
@@ -635,6 +783,10 @@ impl RustAlphaBetaEngine {
                 break;
             }
         }
+
+        // Signal helpers to stop and wait for them to finish
+        stop_flag.store(true, Ordering::Relaxed);
+        for h in helper_handles { h.join().ok(); }
 
         self.deadline = None;
 
@@ -702,196 +854,41 @@ impl RustAlphaBetaEngine {
         repetition: &mut RepetitionTracker,
     ) -> Option<(i32, ChessMove)> {
         let tt_key = board_hash(board);
-        let tt_idx = tt_key as usize & TT_MASK;
-        let tt_move = {
-            let entry = &self.tt[tt_idx];
-            if entry.key == tt_key { entry.best_move } else { None }
-        };
+        let tt_move = self.tt.probe(tt_key).and_then(|e| e.best_move);
         let mut root_moves = self.scored_moves(board, tt_move, 0, false);
         if root_moves.is_empty() {
             return None;
         }
         root_moves.sort_unstable_by(|left, right| right.score.cmp(&left.score));
 
-        if !self.should_parallelize_root(depth, root_moves.len()) {
-            let score = self.negamax(board, depth, alpha, beta, 0, repetition)?;
-            let tt_idx2 = board_hash(board) as usize & TT_MASK;
-            let best_move = {
-                let entry = &self.tt[tt_idx2];
-                if entry.key == board_hash(board) { entry.best_move } else { None }
-            }.or_else(|| MoveGen::new_legal(board).next())?;
-            return Some((score, best_move));
-        }
-
-        self.search_root_parallel(board, depth, alpha, beta, repetition, root_moves)
+        // Always use sequential search (Lazy SMP helpers run in background via choose_move)
+        let score = self.negamax(board, depth, alpha, beta, 0, repetition)?;
+        let best_move = self.tt.probe(tt_key)
+            .and_then(|e| e.best_move)
+            .or_else(|| MoveGen::new_legal(board).next())?;
+        Some((score, best_move))
     }
 
-    fn search_root_parallel(
-        &mut self,
-        board: &Board,
-        depth: i32,
-        alpha: i32,
-        beta: i32,
-        repetition: &mut RepetitionTracker,
-        root_moves: Vec<ScoredMove>,
-    ) -> Option<(i32, ChessMove)> {
-        let first_move = root_moves[0].chess_move;
-        let first_child = board.make_move_new(first_move);
-        let first_hash = board_hash(&first_child);
-        repetition.push(first_hash);
-        let mut best_score =
-            -self.negamax(&first_child, depth - 1, -beta, -alpha, 1, repetition)?;
-        repetition.pop(first_hash);
-        let mut best_move = first_move;
-        let current_alpha = alpha.max(best_score);
-
-        if current_alpha >= beta || root_moves.len() == 1 {
-            self.store_root_result(board, depth, best_score, alpha, beta, best_move);
-            return Some((best_score, best_move));
-        }
-
-        let remaining: Vec<ChessMove> = root_moves
-            .into_iter()
-            .skip(1)
-            .map(|entry| entry.chess_move)
-            .collect();
-        let worker_count = self.threads.min(remaining.len()).max(1);
-        let mut move_groups = vec![Vec::new(); worker_count];
-        for (index, chess_move) in remaining.into_iter().enumerate() {
-            move_groups[index % worker_count].push(chess_move);
-        }
-
-        let board_copy = *board;
-        let repetition_base = repetition.clone();
-        let chunk_results = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(move_groups.len());
-            for group in move_groups {
-                if group.is_empty() {
-                    continue;
-                }
-                let board = board_copy;
-                let repetition = repetition_base.clone();
-                let mut worker = self.worker_clone();
-                handles.push(scope.spawn(move || {
-                    worker.search_root_chunk(board, depth, current_alpha, beta, repetition, group)
-                }));
-            }
-
-            let mut results = Vec::with_capacity(handles.len());
-            for handle in handles {
-                let chunk = handle.join().ok()??;
-                results.push(chunk);
-            }
-            Some(results)
-        })?;
-
-        for chunk in chunk_results {
-            self.nodes = self.nodes.saturating_add(chunk.nodes);
-            self.merge_tt(chunk.tt);
-            if let Some(chess_move) = chunk.best_move {
-                if chunk.best_score > best_score {
-                    best_score = chunk.best_score;
-                    best_move = chess_move;
-                }
-            }
-        }
-
-        self.store_root_result(board, depth, best_score, alpha, beta, best_move);
-        Some((best_score, best_move))
-    }
-
-    fn search_root_chunk(
-        &mut self,
-        board: Board,
-        depth: i32,
-        alpha: i32,
-        beta: i32,
-        repetition: RepetitionTracker,
-        moves: Vec<ChessMove>,
-    ) -> Option<RootChunkResult> {
-        let mut best_move = None;
-        let mut best_score = -INFINITY;
-        let mut local_alpha = alpha;
-
-        for chess_move in moves {
-            if self.should_stop() {
-                break;
-            }
-
-            let child = board.make_move_new(chess_move);
-            let child_hash = board_hash(&child);
-            let mut local_repetition = repetition.clone();
-            local_repetition.push(child_hash);
-
-            let mut score = -self.negamax(
-                &child,
-                depth - 1,
-                -local_alpha - 1,
-                -local_alpha,
-                1,
-                &mut local_repetition,
-            )?;
-            if score > local_alpha {
-                score = -self.negamax(
-                    &child,
-                    depth - 1,
-                    -beta,
-                    -local_alpha,
-                    1,
-                    &mut local_repetition,
-                )?;
-            }
-
-            if score > best_score {
-                best_score = score;
-                best_move = Some(chess_move);
-            }
-            if score > local_alpha {
-                local_alpha = score;
-            }
-        }
-
-        Some(RootChunkResult {
-            best_move,
-            best_score,
-            nodes: self.nodes,
-            tt: std::mem::take(&mut self.tt),
-        })
-    }
-
-    fn should_parallelize_root(&self, _depth: i32, _move_count: usize) -> bool {
-        // Disabled: TT clone overhead (48MB per worker) outweighs parallelism benefit
-        false
-    }
 
     fn worker_clone(&self) -> Self {
+        // SharedTT::clone() is an Arc::clone — cheap, shares same TT
         Self {
             depth: self.depth,
             threads: 1,
             nodes: 0,
             tt: self.tt.clone(),
-            killer_moves: self.killer_moves.clone(),
-            history_heuristic: self.history_heuristic.clone(),
-            capture_history: self.capture_history.clone(),
-            countermove: self.countermove.clone(),
-            move_stack: self.move_stack.clone(),
-            eval_stack: self.eval_stack.clone(),
-            eval_cache: self.eval_cache.clone(),
-            pawn_cache: self.pawn_cache.clone(),
+            killer_moves: vec![[None, None]; KILLER_PLY_CAPACITY],
+            history_heuristic: vec![0; HISTORY_SIZE],
+            capture_history: vec![0; HISTORY_SIZE * CAPTURE_HISTORY_PIECES],
+            countermove: vec![None; HISTORY_SIZE],
+            move_stack: vec![None; KILLER_PLY_CAPACITY],
+            eval_stack: vec![0; KILLER_PLY_CAPACITY],
+            eval_cache: vec![EvalCacheEntry::default(); EVAL_CACHE_SIZE],
+            pawn_cache: vec![PawnCacheEntry::default(); PAWN_CACHE_SIZE],
             deadline: self.deadline,
             stopped: false,
+            stop_flag: Arc::clone(&self.stop_flag),
             opening_book: HashMap::new(), // Workers don't need the opening book
-        }
-    }
-
-    fn merge_tt(&mut self, other: Vec<TTEntry>) {
-        for (i, entry) in other.iter().enumerate() {
-            if entry.key != 0 {
-                let existing = &self.tt[i];
-                if existing.key == 0 || entry.depth >= existing.depth {
-                    self.tt[i] = *entry;
-                }
-            }
         }
     }
 
@@ -912,17 +909,7 @@ impl RustAlphaBetaEngine {
             EXACT
         };
         let key = board_hash(board);
-        let idx = key as usize & TT_MASK;
-        let existing = &self.tt[idx];
-        if existing.key == 0 || depth >= existing.depth || existing.key == key {
-            self.tt[idx] = TTEntry {
-                key,
-                depth,
-                score,
-                flag,
-                best_move: Some(best_move),
-            };
-        }
+        self.tt.store(key, depth, flag, score, Some(best_move), 0);
     }
 
     fn negamax(
@@ -976,14 +963,10 @@ impl RustAlphaBetaEngine {
         let alpha_original = alpha;
         let beta_original = beta;
         let tt_key = board_hash(board);
-        let tt_idx = tt_key as usize & TT_MASK;
-        let tt_entry = {
-            let entry = self.tt[tt_idx];
-            if entry.key == tt_key { Some(entry) } else { None }
-        };
-        let mut tt_move = tt_entry.and_then(|entry| entry.best_move);
+        let tt_entry = self.tt.probe(tt_key);
+        let mut tt_move = tt_entry.as_ref().and_then(|entry| entry.best_move);
 
-        if let Some(entry) = tt_entry {
+        if let Some(ref entry) = tt_entry {
             if entry.depth >= effective_depth {
                 match entry.flag {
                     EXACT => return Some(entry.score),
@@ -1005,8 +988,7 @@ impl RustAlphaBetaEngine {
             };
             if iid_depth > 0 {
                 let _ = self.negamax(board, iid_depth, alpha, beta, ply, repetition);
-                let entry = &self.tt[tt_idx];
-                tt_move = if entry.key == tt_key { entry.best_move } else { None };
+                tt_move = self.tt.probe(tt_key).and_then(|e| e.best_move);
             }
         }
 
@@ -1064,7 +1046,7 @@ impl RustAlphaBetaEngine {
 
         // Singular extension: if TT move is much better than alternatives, extend it
         let mut singular_move: Option<ChessMove> = None;
-        if let (Some(entry), Some(tt_mv)) = (tt_entry, tt_move) {
+        if let (Some(ref entry), Some(tt_mv)) = (tt_entry.as_ref(), tt_move) {
             if effective_depth >= 8
                 && entry.depth >= effective_depth - 3
                 && entry.flag != UPPER_BOUND
@@ -1125,7 +1107,7 @@ impl RustAlphaBetaEngine {
             // Singular extension: extend TT move if it's singularly better
             let mut extension = 0;
             if singular_move == Some(chess_move) {
-                let se_beta = tt_entry.unwrap().score - 2 * effective_depth;
+                let se_beta = tt_entry.as_ref().map_or(0, |e| e.score) - 2 * effective_depth;
                 let se_depth = (effective_depth - 1) / 2;
                 // Search excluding TT move at reduced depth/window
                 let excluded_score = self.negamax_excluding(
@@ -1266,17 +1248,8 @@ impl RustAlphaBetaEngine {
         } else {
             EXACT
         };
-        let new_entry = TTEntry {
-            key: tt_key,
-            depth: effective_depth,
-            score: best_score,
-            flag,
-            best_move,
-        };
-        let existing = &self.tt[tt_idx];
-        if existing.key == 0 || new_entry.depth >= existing.depth || existing.key == tt_key {
-            self.tt[tt_idx] = new_entry;
-        }
+        let existing_depth = tt_entry.as_ref().map_or(0, |e| e.depth);
+        self.tt.store(tt_key, effective_depth, flag, best_score, best_move, existing_depth);
         Some(best_score)
     }
 
@@ -1297,16 +1270,42 @@ impl RustAlphaBetaEngine {
             return Some(terminal_score);
         }
 
+        // TT probe in quiescence — allows reusing previously computed QS results
+        let tt_key = board_hash(board);
+        let alpha_original = alpha;
+        let tt_move = if let Some(entry) = self.tt.probe(tt_key) {
+            // Use TT score if it's an exact or useful bound
+            let qs_depth = 0; // QS has depth 0
+            if entry.depth >= qs_depth {
+                match entry.flag {
+                    EXACT       => return Some(entry.score),
+                    LOWER_BOUND => alpha = alpha.max(entry.score),
+                    UPPER_BOUND => {
+                        if entry.score <= alpha { return Some(entry.score); }
+                    }
+                    _ => {}
+                }
+                if alpha >= beta { return Some(entry.score); }
+            }
+            entry.best_move
+        } else {
+            None
+        };
+
         let in_check_now = in_check(board);
         let stand_pat = self.evaluate(board);
         if !in_check_now {
             if stand_pat >= beta {
+                // Store as lower bound in TT
+                self.tt.store(tt_key, 0, LOWER_BOUND, stand_pat, None, 0);
                 return Some(stand_pat);
             }
             alpha = alpha.max(stand_pat);
         }
 
-        let mut move_picker = self.scored_moves(board, None, ply, !in_check_now);
+        let mut best_score = if in_check_now { -INFINITY } else { stand_pat };
+        let mut best_move: Option<ChessMove> = None;
+        let mut move_picker = self.scored_moves(board, tt_move, ply, !in_check_now);
         for index in 0..move_picker.len() {
             let chess_move = pick_next_move(&mut move_picker, index)?;
             if !in_check_now {
@@ -1328,13 +1327,24 @@ impl RustAlphaBetaEngine {
             let search = self.quiescence(&child, -beta, -alpha, ply + 1, repetition);
             repetition.pop(child_hash);
             let score = -search?;
+            if score > best_score {
+                best_score = score;
+                best_move = Some(chess_move);
+            }
             if score >= beta {
+                // Store lower bound
+                self.tt.store(tt_key, 0, LOWER_BOUND, score, best_move, 0);
                 return Some(score);
             }
-            alpha = alpha.max(score);
+            if score > alpha {
+                alpha = score;
+            }
         }
 
-        Some(alpha)
+        // Store result in TT
+        let flag = if best_score <= alpha_original { UPPER_BOUND } else { EXACT };
+        self.tt.store(tt_key, 0, flag, best_score, best_move, 0);
+        Some(best_score)
     }
 
     /// Simplified negamax that excludes a specific move — used for singular extension verification
@@ -1384,6 +1394,11 @@ impl RustAlphaBetaEngine {
         }
         if self.nodes & 1023 != 0 {
             return false;
+        }
+        // Check shared stop flag (set by main thread or timeout)
+        if self.stop_flag.load(Ordering::Relaxed) {
+            self.stopped = true;
+            return true;
         }
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
@@ -1738,14 +1753,8 @@ impl RustAlphaBetaEngine {
 
         for _ in 0..depth {
             let key = board_hash(&board);
-            let idx = key as usize & TT_MASK;
-            let entry = &self.tt[idx];
-            if entry.key != key {
-                break;
-            }
-            let Some(best_move) = entry.best_move else {
-                break;
-            };
+            let Some(entry) = self.tt.probe(key) else { break };
+            let Some(best_move) = entry.best_move else { break };
             if !move_is_legal(&board, best_move) {
                 break;
             }
