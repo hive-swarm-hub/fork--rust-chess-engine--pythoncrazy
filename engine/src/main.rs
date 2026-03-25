@@ -1444,6 +1444,31 @@ impl RustAlphaBetaEngine {
             return Some(terminal_score);
         }
 
+        // TT probe in quiescence
+        let qs_key = board_hash(board);
+        let qs_tt_idx = qs_key as usize & TT_MASK;
+        let qs_tt_entry = &self.tt[qs_tt_idx];
+        let tt_move = if qs_tt_entry.key == qs_key {
+            let entry = qs_tt_entry;
+            if entry.depth >= 0 {
+                let mut a = alpha;
+                let mut b = beta;
+                match entry.flag {
+                    EXACT => return Some(entry.score),
+                    LOWER_BOUND => a = a.max(entry.score),
+                    UPPER_BOUND => b = b.min(entry.score),
+                    _ => {}
+                }
+                if a >= b {
+                    return Some(entry.score);
+                }
+            }
+            qs_tt_entry.best_move
+        } else {
+            None
+        };
+
+        let alpha_original = alpha;
         let in_check_now = in_check(board);
         let stand_pat = self.evaluate(board);
         if !in_check_now {
@@ -1453,7 +1478,10 @@ impl RustAlphaBetaEngine {
             alpha = alpha.max(stand_pat);
         }
 
-        let mut move_picker = self.scored_moves(board, None, ply, !in_check_now);
+        let mut best_score = if in_check_now { -INFINITY } else { stand_pat };
+        let mut best_move_found: Option<ChessMove> = None;
+
+        let mut move_picker = self.scored_moves(board, tt_move, ply, !in_check_now);
         for index in 0..move_picker.len() {
             let chess_move = pick_next_move(&mut move_picker, index)?;
             if !in_check_now {
@@ -1475,10 +1503,41 @@ impl RustAlphaBetaEngine {
             let search = self.quiescence(&child, -beta, -alpha, ply + 1, repetition);
             repetition.pop(child_hash);
             let score = -search?;
+            if score > best_score {
+                best_score = score;
+                best_move_found = Some(chess_move);
+            }
             if score >= beta {
+                // Store TT cutoff
+                if let Some(bm) = best_move_found {
+                    self.tt[qs_tt_idx] = TTEntry {
+                        key: qs_key,
+                        depth: 0,
+                        score,
+                        flag: LOWER_BOUND,
+                        best_move: Some(bm),
+                    };
+                }
                 return Some(score);
             }
             alpha = alpha.max(score);
+        }
+
+        // Store QS result in TT
+        let flag = if best_score <= alpha_original {
+            UPPER_BOUND
+        } else {
+            EXACT
+        };
+        let existing = &self.tt[qs_tt_idx];
+        if existing.key == 0 || existing.depth <= 0 || existing.key == qs_key {
+            self.tt[qs_tt_idx] = TTEntry {
+                key: qs_key,
+                depth: 0,
+                score: best_score,
+                flag,
+                best_move: best_move_found.or(tt_move),
+            };
         }
 
         Some(alpha)
