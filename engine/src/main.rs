@@ -1054,15 +1054,11 @@ impl RustAlphaBetaEngine {
             }
         }
 
-        let n_checkers = board.checkers().popcnt();
-        let in_check_now = n_checkers > 0;
+        let in_check_now = in_check(board);
         let mut effective_depth = depth;
         // Cap check extension to prevent infinite check sequences
         if in_check_now && ply < 80 {
             effective_depth += 1;
-            if n_checkers > 1 {
-                effective_depth += 1;
-            }
         }
 
         if effective_depth <= 0 {
@@ -1410,6 +1406,27 @@ impl RustAlphaBetaEngine {
             return Some(terminal_score);
         }
 
+        // TT probe in quiescence
+        let qs_key = board_hash(board);
+        let qs_tt_idx = qs_key as usize & TT_MASK;
+        let qs_tt_entry = self.tt[qs_tt_idx];
+        let mut tt_move = None;
+        if qs_tt_entry.key == qs_key {
+            if qs_tt_entry.depth >= 0 {
+                match qs_tt_entry.flag {
+                    EXACT => return Some(qs_tt_entry.score),
+                    LOWER_BOUND => alpha = alpha.max(qs_tt_entry.score),
+                    UPPER_BOUND => { /* beta remains the same */ },
+                    _ => {}
+                }
+                if alpha >= beta {
+                    return Some(qs_tt_entry.score);
+                }
+            }
+            tt_move = qs_tt_entry.best_move;
+        }
+
+        let alpha_original = alpha;
         let in_check_now = in_check(board);
         let stand_pat = self.evaluate(board);
         if !in_check_now {
@@ -1419,7 +1436,9 @@ impl RustAlphaBetaEngine {
             alpha = alpha.max(stand_pat);
         }
 
-        let mut move_picker = self.scored_moves(board, None, ply, !in_check_now);
+        let mut best_score = stand_pat;
+        let mut best_move_found = None;
+        let mut move_picker = self.scored_moves(board, tt_move, ply, !in_check_now);
         for index in 0..move_picker.len() {
             let chess_move = pick_next_move(&mut move_picker, index)?;
             if !in_check_now {
@@ -1441,13 +1460,36 @@ impl RustAlphaBetaEngine {
             let search = self.quiescence(&child, -beta, -alpha, ply + 1, repetition);
             repetition.pop(child_hash);
             let score = -search?;
+            if score > best_score {
+                best_score = score;
+                best_move_found = Some(chess_move);
+            }
             if score >= beta {
-                return Some(score);
+                break;
             }
             alpha = alpha.max(score);
         }
 
-        Some(alpha)
+        // Store QS result in TT
+        let flag = if best_score <= alpha_original {
+            UPPER_BOUND
+        } else if best_score >= beta {
+            LOWER_BOUND
+        } else {
+            EXACT
+        };
+        let existing = &self.tt[qs_tt_idx];
+        if existing.key == 0 || existing.depth <= 0 || existing.key == qs_key {
+            self.tt[qs_tt_idx] = TTEntry {
+                key: qs_key,
+                depth: 0,
+                score: best_score,
+                flag,
+                best_move: best_move_found.or(tt_move),
+            };
+        }
+
+        Some(best_score)
     }
 
     /// Simplified negamax that excludes a specific move — used for singular extension verification
@@ -1624,11 +1666,11 @@ impl RustAlphaBetaEngine {
 
         if piece_bb(board, Color::White, Piece::Bishop).popcnt() >= 2 {
             white_mg += BISHOP_PAIR_BONUS;
-            white_eg += BISHOP_PAIR_BONUS + 6;
+            white_eg += BISHOP_PAIR_BONUS + 20;
         }
         if piece_bb(board, Color::Black, Piece::Bishop).popcnt() >= 2 {
             black_mg += BISHOP_PAIR_BONUS;
-            black_eg += BISHOP_PAIR_BONUS + 6;
+            black_eg += BISHOP_PAIR_BONUS + 20;
         }
 
         white_mg += king_safety_score(
@@ -2726,18 +2768,23 @@ fn rook_activity_score(
     enemy_files: &[u8; 8],
 ) -> i32 {
     let mut score = 0;
+    let mut rooks_on_7th = 0;
     for rook in piece_bb(board, color, Piece::Rook) {
         let file = file_index(rook) as usize;
+        let rank = rank_index(rook);
         if own_files[file] == 0 && enemy_files[file] == 0 {
             score += ROOK_OPEN_FILE_BONUS;
         } else if own_files[file] == 0 {
             score += ROOK_SEMI_OPEN_FILE_BONUS;
         }
 
-        let rank = rank_index(rook);
         if (color == Color::White && rank == 6) || (color == Color::Black && rank == 1) {
             score += ROOK_SEVENTH_RANK_BONUS;
+            rooks_on_7th += 1;
         }
+    }
+    if rooks_on_7th >= 2 {
+        score += 15; // Extra bonus for doubled rooks on 7th
     }
 
     score
@@ -2907,7 +2954,7 @@ fn king_safety_score(
         } else {
             phase + 1
         };
-        score -= pressure * multiplier / 12;
+        score -= pressure * multiplier / 6;
     }
 
     score
