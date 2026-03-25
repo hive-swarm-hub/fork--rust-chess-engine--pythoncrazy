@@ -1091,6 +1091,9 @@ impl RustAlphaBetaEngine {
                     return Some(entry.score);
                 }
             }
+        } else if effective_depth >= 4 {
+            // Internal Iterative Reduction: if no TT move, reduce depth
+            effective_depth -= 1;
         }
 
         if tt_move.is_none() && effective_depth >= 6 && !in_check_now {
@@ -1271,26 +1274,30 @@ impl RustAlphaBetaEngine {
                     && !in_check_now
                     && !gives_check_move
                 {
-                    let mut reduction = late_move_reduction(effective_depth, move_count);
-                    // Reduce less for countermoves and killers
-                    let mk = move_key(chess_move) as usize;
-                    if self.killer_moves.get(ply).map_or(false, |k| {
-                        k[0] == Some(chess_move) || k[1] == Some(chess_move)
-                    }) {
-                        reduction = (reduction - 1).max(0);
-                    }
-                    // Reduce more if not improving
-                    if !improving {
-                        reduction += 1;
-                    }
-                    // Reduce more for moves with bad history
-                    let hist = self.history_heuristic[mk];
-                    if hist < -2000 {
-                        reduction += 1;
-                    } else if hist > 8000 {
-                        reduction = (reduction - 1).max(0);
-                    }
-                    search_depth = (search_depth - reduction).max(0);
+                let mut reduction = late_move_reduction(effective_depth, move_count);
+                // Reduce less for countermoves and killers
+                let mk = move_key(chess_move) as usize;
+                if self.killer_moves.get(ply).map_or(false, |k| {
+                    k[0] == Some(chess_move) || k[1] == Some(chess_move)
+                }) {
+                    reduction = (reduction - 1).max(0);
+                }
+                // Reduce more if not improving
+                if !improving {
+                    reduction += 1;
+                }
+                // Dynamic history-based LMR
+                let hist = self.history_heuristic[mk];
+                if hist < -4000 {
+                    reduction += 2;
+                } else if hist < -1000 {
+                    reduction += 1;
+                } else if hist > 10000 {
+                    reduction = (reduction - 2).max(0);
+                } else if hist > 3000 {
+                    reduction = (reduction - 1).max(0);
+                }
+                search_depth = (search_depth - reduction).max(0);
                 }
 
                 let mut score = -self.negamax(
