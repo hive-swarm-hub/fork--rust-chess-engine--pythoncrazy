@@ -245,9 +245,9 @@ const THREAT_ROOK_BY_MINOR: i32 = 20;
 const THREAT_QUEEN_BY_MINOR: i32 = 30;
 const THREAT_QUEEN_BY_ROOK: i32 = 25;
 
-const PASSED_PAWN_BONUS: [i32; 8] = [0, 8, 12, 20, 35, 60, 90, 0];
-const ENDGAME_PASSED_PAWN_BONUS: [i32; 8] = [0, 0, 4, 8, 16, 32, 56, 0];
-const SUPPORTED_PASSED_PAWN_BONUS: [i32; 8] = [0, 0, 3, 6, 12, 20, 32, 0];
+const PASSED_PAWN_BONUS: [i32; 8] = [0, 8, 12, 22, 42, 75, 120, 0];
+const ENDGAME_PASSED_PAWN_BONUS: [i32; 8] = [0, 0, 8, 18, 38, 70, 140, 0];
+const SUPPORTED_PASSED_PAWN_BONUS: [i32; 8] = [0, 0, 4, 8, 16, 28, 45, 0];
 const REVERSE_FUTILITY_MARGIN: [i32; 5] = [0, 75, 140, 225, 310];
 const FUTILITY_MARGIN: [i32; 5] = [0, 90, 155, 245, 340];
 const RAZOR_MARGIN: [i32; 4] = [0, 230, 360, 500];
@@ -1054,11 +1054,15 @@ impl RustAlphaBetaEngine {
             }
         }
 
-        let in_check_now = in_check(board);
+        let n_checkers = board.checkers().popcnt();
+        let in_check_now = n_checkers > 0;
         let mut effective_depth = depth;
         // Cap check extension to prevent infinite check sequences
         if in_check_now && ply < 80 {
             effective_depth += 1;
+            if n_checkers > 1 {
+                effective_depth += 1;
+            }
         }
 
         if effective_depth <= 0 {
@@ -1588,8 +1592,8 @@ impl RustAlphaBetaEngine {
         let black_mobility = mobility_score(board, Color::Black);
         white_mg += white_mobility;
         black_mg += black_mobility;
-        white_eg += white_mobility / 2;
-        black_eg += black_mobility / 2;
+        white_eg += white_mobility * 3 / 4;
+        black_eg += black_mobility * 3 / 4;
 
         let white_rook_activity = rook_activity_score(
             board,
