@@ -1,0 +1,306 @@
+diff --git a/engine/src/main.rs b/engine/src/main.rs
+index 1fd6490..bdfef75 100644
+--- a/engine/src/main.rs
++++ b/engine/src/main.rs
+@@ -148,7 +148,7 @@ const KILLER_PLY_CAPACITY: usize = 128;
+ const MAX_ROOT_THREADS: usize = 8;
+ 
+ // Fixed-size hash tables (power-of-2 for fast masking)
+-const TT_SIZE: usize = 1 << 21; // 2M entries
++const TT_SIZE: usize = 1 << 23; // 8M entries (~128MB for 64+ threads)
+ const TT_MASK: usize = TT_SIZE - 1;
+ const EVAL_CACHE_SIZE: usize = 1 << 19; // 512K entries
+ const EVAL_CACHE_MASK: usize = EVAL_CACHE_SIZE - 1;
+@@ -166,6 +166,94 @@ const EXACT: u8 = 0;
+ const LOWER_BOUND: u8 = 1;
+ const UPPER_BOUND: u8 = 2;
+ 
++// ====== NNUE Evaluation (akimbo architecture, MIT license) ======
++// Network: 768*4 king-bucketed features → 1024 hidden (SCReLU) → 1 output
++const NNUE_HIDDEN: usize = 1024;
++const NNUE_SCALE: i32 = 400;
++const NNUE_QA: i32 = 255;
++const NNUE_QAB: i32 = NNUE_QA * 64;
++
++#[derive(Clone, Copy)]
++#[repr(C, align(64))]
++struct NnueAcc { vals: [i16; NNUE_HIDDEN] }
++
++#[repr(C)]
++struct NnueNet {
++    feature_weights: [NnueAcc; 768 * 4],
++    feature_bias:    NnueAcc,
++    output_weights:  [NnueAcc; 2],
++    output_bias:     i16,
++}
++
++const _NET_SIZE_CHECK: () = assert!(std::mem::size_of::<NnueNet>() == 6_297_664);
++
++static NNUE: NnueNet = unsafe {
++    std::mem::transmute(*include_bytes!("../resources/net.bin"))
++};
++
++#[rustfmt::skip]
++const NNUE_BUCKET_MAP: [usize; 64] = [
++    0, 0, 1, 1, 5, 5, 4, 4,
++    2, 2, 2, 2, 6, 6, 6, 6,
++    3, 3, 3, 3, 7, 7, 7, 7,
++    3, 3, 3, 3, 7, 7, 7, 7,
++    3, 3, 3, 3, 7, 7, 7, 7,
++    3, 3, 3, 3, 7, 7, 7, 7,
++    3, 3, 3, 3, 7, 7, 7, 7,
++    3, 3, 3, 3, 7, 7, 7, 7,
++];
++
++fn nnue_eval(board: &Board) -> i32 {
++    let stm = board.side_to_move();
++    let wksq = match king_square(board, Color::White) { Some(s) => s.to_index(), None => return 0 };
++    let bksq = match king_square(board, Color::Black) { Some(s) => s.to_index(), None => return 0 };
++
++    // Horizontal flip if king is on right half (so king is always treated as left-half)
++    let w_hflip: usize = if wksq % 8 > 3 { 7 } else { 0 };
++    let b_hflip: usize = if bksq % 8 > 3 { 7 } else { 0 };
++    let wflip = w_hflip;
++    let bflip = b_hflip ^ 56; // also vertical flip for black perspective
++
++    let w_bucket = NNUE_BUCKET_MAP[wksq ^ w_hflip];
++    let b_bucket = NNUE_BUCKET_MAP[(bksq ^ b_hflip) ^ 56];
++
++    let mut white_acc = NNUE.feature_bias.vals;
++    let mut black_acc = NNUE.feature_bias.vals;
++
++    for &color in &[Color::White, Color::Black] {
++        let side = if color == Color::White { 0usize } else { 1 };
++        for &pc in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen, Piece::King] {
++            let pc_idx = pc.to_index();
++            // White perspective: own=0, opp=384
++            let w_base = 768 * w_bucket + side * 384 + 64 * pc_idx;
++            // Black perspective: own=0, opp=384 (so black's pieces = side 1 → offset 0)
++            let b_base = 768 * b_bucket + (1 - side) * 384 + 64 * pc_idx;
++            for sq in piece_bb(board, color, pc) {
++                let sq = sq.to_index();
++                let wi = w_base + (sq ^ wflip);
++                let bi = b_base + (sq ^ bflip);
++                let ww = &NNUE.feature_weights[wi].vals;
++                let bw = &NNUE.feature_weights[bi].vals;
++                for i in 0..NNUE_HIDDEN {
++                    white_acc[i] += ww[i];
++                    black_acc[i] += bw[i];
++                }
++            }
++        }
++    }
++
++    let (boys, opps) = if stm == Color::White { (&white_acc, &black_acc) } else { (&black_acc, &white_acc) };
++    let bw = &NNUE.output_weights[0].vals;
++    let ow = &NNUE.output_weights[1].vals;
++    let mut sum = 0i64;
++    for i in 0..NNUE_HIDDEN {
++        let b = boys[i].clamp(0, NNUE_QA as i16) as i64;
++        let o = opps[i].clamp(0, NNUE_QA as i16) as i64;
++        sum += b * b * bw[i] as i64 + o * o * ow[i] as i64;
++    }
++    ((sum / NNUE_QA as i64 + NNUE.output_bias as i64) * NNUE_SCALE as i64 / NNUE_QAB as i64) as i32
++}
++
+ const PAWN: i32 = 100;
+ const KNIGHT: i32 = 310;
+ const BISHOP: i32 = 333;
+@@ -705,7 +793,7 @@ impl RustAlphaBetaEngine {
+         // Each helper uses the same board & repetition context, but has independent
+         // history/killers so they explore different branches. The shared TT propagates
+         // all knowledge across threads automatically.
+-        let n_helpers = self.threads.saturating_sub(1).min(7); // cap at 7 helpers
++        let n_helpers = self.threads.saturating_sub(1).min(7); // cap at 7 helpers (8 total)
+         let helper_handles: Vec<_> = if n_helpers > 0 && time_budget.is_some() {
+             let board_copy = board;
+             let rep_copy = repetition.clone();
+@@ -1417,187 +1505,7 @@ impl RustAlphaBetaEngine {
+             return cached.score;
+         }
+ 
+-        let phase = game_phase(board);
+-        let endgame = phase <= 6;
+-        let mut white_mg = 0;
+-        let mut black_mg = 0;
+-        let mut white_eg = 0;
+-        let mut black_eg = 0;
+-
+-        for square in piece_bb(board, Color::White, Piece::Pawn) {
+-            let idx = square_index(square);
+-            white_mg += PAWN + PAWN_TABLE[idx];
+-            white_eg += PAWN + PAWN_EG_TABLE[idx];
+-        }
+-        for square in piece_bb(board, Color::Black, Piece::Pawn) {
+-            let idx = mirror_index(square_index(square));
+-            black_mg += PAWN + PAWN_TABLE[idx];
+-            black_eg += PAWN + PAWN_EG_TABLE[idx];
+-        }
+-
+-        for square in piece_bb(board, Color::White, Piece::Knight) {
+-            let idx = square_index(square);
+-            white_mg += KNIGHT + KNIGHT_TABLE[idx];
+-            white_eg += KNIGHT + KNIGHT_EG_TABLE[idx];
+-        }
+-        for square in piece_bb(board, Color::Black, Piece::Knight) {
+-            let idx = mirror_index(square_index(square));
+-            black_mg += KNIGHT + KNIGHT_TABLE[idx];
+-            black_eg += KNIGHT + KNIGHT_EG_TABLE[idx];
+-        }
+-
+-        for square in piece_bb(board, Color::White, Piece::Bishop) {
+-            let idx = square_index(square);
+-            white_mg += BISHOP + BISHOP_TABLE[idx];
+-            white_eg += BISHOP + BISHOP_EG_TABLE[idx];
+-        }
+-        for square in piece_bb(board, Color::Black, Piece::Bishop) {
+-            let idx = mirror_index(square_index(square));
+-            black_mg += BISHOP + BISHOP_TABLE[idx];
+-            black_eg += BISHOP + BISHOP_EG_TABLE[idx];
+-        }
+-
+-        for square in piece_bb(board, Color::White, Piece::Rook) {
+-            let idx = square_index(square);
+-            white_mg += ROOK + ROOK_TABLE[idx];
+-            white_eg += ROOK + ROOK_EG_TABLE[idx];
+-        }
+-        for square in piece_bb(board, Color::Black, Piece::Rook) {
+-            let idx = mirror_index(square_index(square));
+-            black_mg += ROOK + ROOK_TABLE[idx];
+-            black_eg += ROOK + ROOK_EG_TABLE[idx];
+-        }
+-
+-        for square in piece_bb(board, Color::White, Piece::Queen) {
+-            let idx = square_index(square);
+-            white_mg += QUEEN + QUEEN_TABLE[idx];
+-            white_eg += QUEEN + QUEEN_EG_TABLE[idx];
+-        }
+-        for square in piece_bb(board, Color::Black, Piece::Queen) {
+-            let idx = mirror_index(square_index(square));
+-            black_mg += QUEEN + QUEEN_TABLE[idx];
+-            black_eg += QUEEN + QUEEN_EG_TABLE[idx];
+-        }
+-
+-        white_mg += king_position_score(board, Color::White, false);
+-        black_mg += king_position_score(board, Color::Black, false);
+-        white_eg += king_position_score(board, Color::White, true);
+-        black_eg += king_position_score(board, Color::Black, true);
+-
+-        let pawn_entry = self.pawn_entry(board);
+-        white_mg += pawn_entry.white_structure_mg + pawn_entry.white_center_mg;
+-        black_mg += pawn_entry.black_structure_mg + pawn_entry.black_center_mg;
+-        white_eg += pawn_entry.white_structure_eg;
+-        black_eg += pawn_entry.black_structure_eg;
+-
+-        let white_mobility = mobility_score(board, Color::White);
+-        let black_mobility = mobility_score(board, Color::Black);
+-        white_mg += white_mobility;
+-        black_mg += black_mobility;
+-        white_eg += white_mobility / 2;
+-        black_eg += black_mobility / 2;
+-
+-        let white_rook_activity = rook_activity_score(
+-            board,
+-            Color::White,
+-            &pawn_entry.white_files,
+-            &pawn_entry.black_files,
+-        );
+-        let black_rook_activity = rook_activity_score(
+-            board,
+-            Color::Black,
+-            &pawn_entry.black_files,
+-            &pawn_entry.white_files,
+-        );
+-        white_mg += white_rook_activity;
+-        black_mg += black_rook_activity;
+-        white_eg += white_rook_activity;
+-        black_eg += black_rook_activity;
+-
+-        let white_outposts = knight_outpost_score(board, Color::White);
+-        let black_outposts = knight_outpost_score(board, Color::Black);
+-        white_mg += white_outposts;
+-        black_mg += black_outposts;
+-        white_eg += white_outposts / 3;
+-        black_eg += black_outposts / 3;
+-
+-        white_mg += development_score(board, Color::White, endgame);
+-        black_mg += development_score(board, Color::Black, endgame);
+-
+-        if piece_bb(board, Color::White, Piece::Bishop).popcnt() >= 2 {
+-            white_mg += BISHOP_PAIR_BONUS;
+-            white_eg += BISHOP_PAIR_BONUS + 6;
+-        }
+-        if piece_bb(board, Color::Black, Piece::Bishop).popcnt() >= 2 {
+-            black_mg += BISHOP_PAIR_BONUS;
+-            black_eg += BISHOP_PAIR_BONUS + 6;
+-        }
+-
+-        white_mg += king_safety_score(
+-            board,
+-            Color::White,
+-            phase,
+-            &pawn_entry.white_files,
+-            &pawn_entry.black_files,
+-        );
+-        black_mg += king_safety_score(
+-            board,
+-            Color::Black,
+-            phase,
+-            &pawn_entry.black_files,
+-            &pawn_entry.white_files,
+-        );
+-
+-        // Threat evaluation
+-        let white_threats = threat_score(board, Color::White);
+-        let black_threats = threat_score(board, Color::Black);
+-        white_mg += white_threats;
+-        black_mg += black_threats;
+-        white_eg += white_threats / 2;
+-        black_eg += black_threats / 2;
+-
+-        // Connected rooks bonus
+-        let white_connected = connected_rooks_score(board, Color::White);
+-        let black_connected = connected_rooks_score(board, Color::Black);
+-        white_mg += white_connected;
+-        black_mg += black_connected;
+-
+-        // Passed pawn king distance (endgame only)
+-        white_eg += passed_pawn_king_bonus(board, Color::White);
+-        black_eg += passed_pawn_king_bonus(board, Color::Black);
+-
+-        // Mop-up eval: drive enemy king to corner in won endgames
+-        let white_mopup = mopup_score(board, Color::White);
+-        let black_mopup = mopup_score(board, Color::Black);
+-        white_eg += white_mopup;
+-        black_eg += black_mopup;
+-
+-        let white_score = tapered_score(white_mg, white_eg, phase);
+-        let black_score = tapered_score(black_mg, black_eg, phase);
+-
+-        let mut score = if board.side_to_move() == Color::White {
+-            white_score - black_score + TEMPO_BONUS
+-        } else {
+-            black_score - white_score + TEMPO_BONUS
+-        };
+-
+-        // Contempt: penalize draws slightly when we have material advantage
+-        // This makes the engine play for wins against weaker opponents
+-        if score.abs() < 50 {
+-            let our_material = if board.side_to_move() == Color::White {
+-                white_mg
+-            } else {
+-                black_mg
+-            };
+-            let their_material = if board.side_to_move() == Color::White {
+-                black_mg
+-            } else {
+-                white_mg
+-            };
+-            if our_material > their_material + 100 {
+-                score += CONTEMPT;
+-            }
+-        }
++        let score = nnue_eval(board);
+ 
+         self.eval_cache[eval_idx] = EvalCacheEntry { key: board_key, score };
+         score

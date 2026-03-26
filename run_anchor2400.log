@@ -1,0 +1,84 @@
+WARNING: No checksum file found. Run prepare.sh to create one.
+Compiling engine...
+Compiled in 0s.
+Running gauntlet tournament...
+Gauntlet: 5 SF levels (2200-2600) x 2 games (engine 500ms, SF 100ms)...
+Running: tools/cutechess-cli -engine cmd=engine/target/release/hive-chess proto=uci name=HiveChess tc=40/20 -engine cmd=tools/stockfish proto=uci name=SF_2200 tc=40/4 option.UCI_LimitStrength=true option.UCI_Elo=2200 option.Threads=1 option.Hash=16 -engine cmd=tools/stockfish proto=uci name=SF_2300 tc=40/4 option.UCI_LimitStrength=true option.UCI_Elo=2300 option.Threads=1 option.Hash=16 -engine cmd=tools/stockfish proto=uci name=SF_2400 tc=40/4 option.UCI_LimitStrength=true option.UCI_Elo=2400 option.Threads=1 option.Hash=16 -engine cmd=tools/stockfish proto=uci name=SF_2500 tc=40/4 option.UCI_LimitStrength=true option.UCI_Elo=2500 option.Threads=1 option.Hash=16 -engine cmd=tools/stockfish proto=uci name=SF_2600 tc=40/4 option.UCI_LimitStrength=true option.UCI_Elo=2600 option.Threads=1 option.Hash=16 -tournament gauntlet -rounds 1 -games 2 -repeat -pgnout eval/games.pgn -recover -wait 50 -openings file=eval/openings.epd format=epd order=random
+Indexing opening suite...
+Started game 1 of 10 (HiveChess vs SF_2200)
+Finished game 1 (HiveChess vs SF_2200): 1-0 {White mates}
+Started game 2 of 10 (SF_2200 vs HiveChess)
+Finished game 2 (SF_2200 vs HiveChess): 1-0 {White mates}
+Started game 3 of 10 (HiveChess vs SF_2300)
+Finished game 3 (HiveChess vs SF_2300): 1-0 {White mates}
+Started game 4 of 10 (SF_2300 vs HiveChess)
+Finished game 4 (SF_2300 vs HiveChess): 0-1 {Black mates}
+Started game 5 of 10 (HiveChess vs SF_2400)
+Finished game 5 (HiveChess vs SF_2400): 0-1 {Black mates}
+Started game 6 of 10 (SF_2400 vs HiveChess)
+Finished game 6 (SF_2400 vs HiveChess): 0-1 {Black mates}
+Started game 7 of 10 (HiveChess vs SF_2500)
+Finished game 7 (HiveChess vs SF_2500): 1-0 {White mates}
+Started game 8 of 10 (SF_2500 vs HiveChess)
+Finished game 8 (SF_2500 vs HiveChess): 0-1 {Black mates}
+Started game 9 of 10 (HiveChess vs SF_2600)
+Finished game 9 (HiveChess vs SF_2600): 1-0 {White mates}
+Started game 10 of 10 (SF_2600 vs HiveChess)
+Finished game 10 (SF_2600 vs HiveChess): 1-0 {White mates}
+Rank Name                          Elo     +/-   Games   Score    Draw 
+   0 HiveChess                     147     385      10   70.0%    0.0% 
+   1 SF_2600                         0     nan       2   50.0%    0.0% 
+   2 SF_2400                         0     nan       2   50.0%    0.0% 
+   3 SF_2200                         0     nan       2   50.0%    0.0% 
+   4 SF_2500                      -inf     nan       2    0.0%    0.0% 
+   5 SF_2300                      -inf     nan       2    0.0%    0.0% 
+
+SPRT: llr 0 (0.0%), lbound -inf, ubound inf
+
+Player: HiveChess
+   "Loss: Black mates": 1
+   "Loss: White mates": 2
+   "Win: Black mates": 3
+   "Win: White mates": 4
+Player: SF_2200
+   "Loss: White mates": 1
+   "Win: White mates": 1
+Player: SF_2300
+   "Loss: Black mates": 1
+   "Loss: White mates": 1
+Player: SF_2400
+   "Loss: Black mates": 1
+   "Win: Black mates": 1
+Player: SF_2500
+   "Loss: Black mates": 1
+   "Loss: White mates": 1
+Player: SF_2600
+   "Loss: White mates": 1
+   "Win: White mates": 1
+Finished match
+Computing ELO...
+elo: 2569.5
+games_played: 10
+score_pct: 0.700
+total_wins: 7
+total_draws: 0
+total_losses: 3
+ci_95: 250.1
+
+Per-opponent breakdown:
+  vs SF_2200 (2200): +1 =0 -1 [0.500]
+  vs SF_2300 (2300): +2 =0 -0 [1.000]
+  vs SF_2400 (2400): +1 =0 -1 [0.500]
+  vs SF_2500 (2500): +2 =0 -0 [1.000]
+  vs SF_2600 (2600): +1 =0 -1 [0.500]
+---
+elo:              2569.5
+games_played:     10
+score_pct:        0.700
+wins:             7
+draws:            0
+losses:           3
+binary_bytes:     1469928
+line_count:       2780
+compile_secs:     0
+valid:            true
